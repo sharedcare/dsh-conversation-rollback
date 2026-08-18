@@ -1,0 +1,7 @@
+# conversation-rollback bundle patch.
+# Installed via `dsh plugin --profile web add conversation-rollback-<version>.tgz`.
+# Do not also add a manual `- insert: conversation-rollback` row in the profile
+# cordis.patch.yml; this bundle layer inserts that row for you.
+- insert:
+    - id: conversation-rollback
+      name: conversation-rollback
