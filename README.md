@@ -3,7 +3,108 @@
 Codex-style conversation rollback and "edit input, then re-generate" for the
 DeepSeek Harness (DSH) Web UI.
 
+> **这里是本地 fork。** 基线是 upstream v1.3.0
+> （<https://github.com/sharedcare/dsh-conversation-rollback>），在它之上合并了
+> `dsh-session-toc`——消息流右缘的 outline rail（会话目录）。下面 `## English` / `## 中文`
+> 两节是 **upstream 原文**，只有安装方式与文件布局以紧接其后的这一节为准。
+
 [English](#english) · [中文](#中文)
+
+---
+
+## 本 fork 的改动：outline rail（会话目录）
+
+- 收起态：26px 窄条贴消息流右缘，每根刻度 = 你发过的一条提问，蓝点 = 当前视口所在轮次。
+- 展开态（悬停 / 点 ☰ / `Ctrl/Cmd+Shift+O` 固定展开）：按轮次列出你发过的每条提问（含 `steering` 中途引导），点击即滚动到那一轮并闪一下高亮。
+- 搜索：已加载窗口里没有命中就**自动向更早翻页**（`session.loadOlder()`，上限 40 页）直到匹配出现。
+- 只收 `user` / `steering` 两类 Chat Node：空白输入、纯图片输入、工具行、注入上下文都不进目录。
+- 定位基准是会话列（`[data-conversation-scroll]`）的几何而**不是窗口**，并用 ResizeObserver 跟随。`dsh-better-sidebar` 是 layout push（`#root { margin-right: var(--dsh-sidebar-width) }` + 固定面板盖住让出的那条带），DSH 自己的 details 列和侧卡底部面板同理——按窗口右缘定位必然被压住。rail 也不跟侧卡抢 z-index（它自己叠了 50/52/55/60，60 那层是它的下拉菜单）。
+- pinned 状态存在 `localStorage['dsh-session-toc:pinned']`：沿用旧独立插件的 key，所以合并后原有的固定状态继续生效。
+
+## 代码布局：`src/` 是手写的，`lib/` 是产物
+
+模块加载器每个插件 entry 只服务一个文件（`/plugins/<id>/client.js`），factory 里的 `require`
+只能解析共享模块表（react、react-dom/client、被 inject 的 `@deepseek-ai/*`），所以两个功能不可能留成两个 bundle。
+
+| 文件 | 角色 |
+| --- | --- |
+| `src/client.rollback.js` | rollback 的 client bundle（上游原文 + 下面唯一一处 `FORK DEVIATION`） |
+| `src/session-toc.js` | rail 的 factory body（外壳已剥掉） |
+| `lib/client.js` | `pnpm run build` 的产物，**不要手改** |
+| `lib/index.js` | 宿主半，与上游一致 |
+| `tools/merge-client.mjs` | 拼接 / 反拼接 |
+| `test/smoke.mjs` | 无浏览器冒烟测试（`pnpm test`） |
+
+rail 被包进自己的 IIFE，这是硬性要求而不是风格问题：两半都声明 `function apply`，同一个 factory
+作用域里裸拼接是**合法 JavaScript 且后声明者静默胜出**——rollback 的三处 slot 注册会直接消失，不抛任何错。
+胶水只在尾部一处：`applyAll` 先跑 rollback，rail 包在 try/catch 里（rail 坏掉不能带崩 rollback）。
+
+**与上游的唯一偏差**（`src/client.rollback.js` 里标了 `FORK DEVIATION`）：给它注入的 `<style>` 补上
+`data-plugin` / `data-plugin-css`。`dsh-client-hmr` 热替换只回收 `style[data-plugin="<loader entry 名>"]`
+（`dsh-client-hmr/lib/client.js:26-29`，逐字比对包名），不打标记每次重建都会多留一份旧 CSS。
+
+**生成物为什么入库**：本包不声明 `prepare`。[发布规范](https://deepseek-harness.github.io/deepseek-harness/en/develop/basic/publish)
+写明 `github:` 安装拉的是**源码且不会运行 build**，作者要么提供一个自包含的 `prepare`（用户还得在 profile 的
+`pnpm-workspace.yaml` 里写 `allowBuilds: { conversation-rollback: true }` 才允许跑，等于授权该包在你机器上执行代码），
+要么直接分发产物。这里选后者：产物已提交，`github:` 安装零构建、零授权。所以 `.gitignore` 里明确写了不许忽略 `lib/`。
+
+## 改代码
+
+```bash
+pnpm run build        # src/client.rollback.js + src/session-toc.js -> lib/client.js
+pnpm test             # node --check + 无浏览器冒烟
+pnpm run build:strip  # 反操作：lib/client.js -> src/client.rollback.js
+```
+
+`build` 不是 npm 生命周期脚本，装上本包不会被触发，只有开发者手动跑（会被触发的是 `prepare`，本包故意没有）。
+
+merge 与 strip 是**精确互逆**的（已验证往返字节一致），生成段用 `/* == session-toc: BEGIN/END ... == */`
+成对标记框住。所以 `lib/client.js` 被别处（上游）改过时，冲突可以整体挪出这个特性：
+
+```bash
+git merge <上游>                 # 冲突落在 lib/client.js
+node tools/merge-client.mjs --strip   # 先摘掉生成段，冲突面缩回纯 rollback
+# 在 src/client.rollback.js 上解决冲突（或直接取上游版本），然后：
+pnpm run build && pnpm test
+```
+
+生成器在锚点（`exports.apply = apply;` 与 `exports.name = "conversation-rollback";` 的**整行**）缺失或不唯一时
+报错退出，不会产出一个少一半功能的 bundle——整行锚点也保证不会把上游那行的缩进吞掉。`test/smoke.mjs`
+既验 rail 的目录投影 / 向前翻页 / prepend 时的滚动补偿，也钉住合并本身（两半各自的注册都在、rollback 的
+`user` 节点接管仍是 `priority: -1`、rail 抛错不会带崩 rollback、两份样式都带 HMR 可回收的归属标记）。
+
+## 安装
+
+**先确认你在用哪个 profile**——`desktop` 与 `web` 是两份独立组合（各自 `package.json` + `node_modules`），装错那份重启多少次都不会出现：
+
+```powershell
+# 端口取 $env:DSH_WEB_URL；命中 dsh-plugin-desktop 就说明是桌面 profile
+(Invoke-WebRequest "http://127.0.0.1:<端口>/" -UseBasicParsing).Content | Select-String "dsh-plugin-desktop"
+```
+
+从 git 装（本包产物已提交，所以不需要 `allowBuilds` 授权；规范建议锁 commit，避免后续推送悄悄改变实际运行的代码）：
+
+```powershell
+dsh plugin --profile desktop add github:sharedcare/dsh-conversation-rollback#<sha>
+```
+
+本地 link 装（开发循环，改完刷新即可）：
+
+```powershell
+dsh plugin --profile desktop add link:C:/Users/<you>/Projects/<path>/conversation-rollback
+
+# 之前单独装过 dsh-session-toc 的话务必卸掉，否则会挂出两条 rail
+dsh plugin --profile desktop remove dsh-session-toc
+```
+
+改 `src/session-toc.js` 或 `src/client.rollback.js` 之后：`pnpm run build` 再刷新页面即可（宿主按请求读盘，改产物不需要重启；只有**新增/删除插件**才需要重启，因为 bundle 树在宿主启动时组合）。
+判断有没有真挂上：`http://127.0.0.1:<端口>/plugins/conversation-rollback/client.js` 返 200 且内容里搜得到 `dsh-toc-root`。
+
+桌面端 `dsh plugin` 背后有个安装恢复账本（`%APPDATA%\DSH Desktop\plugin-install-recovery\state.json`）：一次安装会停在
+`phase: "awaiting-restart"`，下一次安装被 `another plugin install recovery transaction is pending` 挡下，而结清只能靠重启
+Desktop（启动健康确认）或在恢复页回滚——没有 CLI 提交命令。需要绕开就给那一次调用换 WAL 位置（校验只要求文件名为
+`state.json`、父目录名为 `plugin-install-recovery`，再往上的父级随意，见 `install-recovery-BD5jkQTK.js:121-129`）；
+代价是这次安装不进应用的固定账本，不会被自动回滚。
 
 ---
 

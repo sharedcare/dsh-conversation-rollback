@@ -1,9 +1,14 @@
 {
   "name": "conversation-rollback",
-  "version": "1.3.0",
-  "description": "Codex-style in-place conversation rollback and edit-and-resend for the DeepSeek Harness web GUI",
+  "version": "1.4.0",
+  "description": "Codex-style in-place conversation rollback and edit-and-resend for the DeepSeek Harness web GUI, plus a right-edge outline rail (session table of contents) whose search pages backwards through history until it matches",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "build": "node tools/merge-client.mjs",
+    "build:strip": "node tools/merge-client.mjs --strip",
+    "test": "node --check lib/client.js && node --check lib/index.js && node test/smoke.mjs"
+  },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
@@ -22,6 +27,8 @@
     "client": {
       "platform": "web",
       "inject": [
+        "@deepseek-ai/dsh-client-runtime",
+        "@deepseek-ai/dsh-client-ui-slots",
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
