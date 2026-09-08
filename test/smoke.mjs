@@ -158,7 +158,15 @@ function makeSession(id, initial, options) {
   const listeners = new Set()
   const session = {
     getSnapshot() {
-      return { sessionId: id, chat: makeChat(state.messages), hasMore: state.hasMore, loadingOlder: false, running: false }
+      // `omitChat` models DSH >= 0.1.2-rc.1, whose session snapshot carries no
+      // `chat` field (the Chat target is a separate view target).
+      return {
+        sessionId: id,
+        ...(options.omitChat ? {} : { chat: makeChat(state.messages) }),
+        hasMore: state.hasMore,
+        loadingOlder: false,
+        running: false,
+      }
     },
     subscribe(listener) {
       listeners.add(listener)
@@ -203,10 +211,26 @@ function makeSessions(id, initial, options) {
  * merge is pinned, and it is the reason `get('slots')` is wired here: the rail
  * guards on `ctx.get('slots')`, so a stub that omits it silently skips its only
  * registration instead of failing.
+ *
+ * `subscribe(name, listener)` records the entry-mutation watches (the takeover's
+ * registration path); `fireSlotsChanged()` delivers one mutation so a case can
+ * model the official `user` renderer registering after this plugin activated.
+ * `uiConversation` exposes the per-session Chat view target the rail reads on
+ * DSH >= 0.1.2-rc.1.
  */
-function makeCtx(sessions) {
+function makeCtx(sessions, options = {}) {
   const effects = []
   const registrations = []
+  const subscriptions = []
+  const chatTargetNames = []
+  let officialUser = options.officialUser !== false
+  const chatTarget = {
+    getSnapshot: () => (options.chat !== undefined ? options.chat : sessions.session.getSnapshot().chat),
+    subscribe(listener) { return sessions.session.subscribe(listener) },
+  }
+  const uiConversation = options.chatTarget === false ? undefined : {
+    binding: () => ({ target: (name) => { chatTargetNames.push(name); return chatTarget } }),
+  }
   const slots = {
     inject(name, callback) {
       registrations.push({ via: 'inject', name })
@@ -217,18 +241,26 @@ function makeCtx(sessions) {
       registrations.push({ via: 'register', name: options.name, id: options.id, key: options.key, priority: options.priority })
       return () => {}
     },
+    subscribe(name, listener) {
+      subscriptions.push({ name, listener })
+      return () => {}
+    },
     // Rollback wraps the built-in `user` Chat Node view; hand it an original so
     // the takeover branch runs instead of being skipped.
     entries(name) {
-      if (name !== 'conversation.chat.node') return []
+      if (name !== 'conversation.chat.node' || !officialUser) return []
       return [{ options: { key: 'user' }, component: function OriginalUserMessageNodeView() { return null } }]
     },
   }
   return {
     effects,
     registrations,
+    subscriptions,
+    chatTargetNames,
     slots,
-    get: (name) => (name === 'sessions' ? sessions : name === 'slots' ? slots : undefined),
+    setOfficialUser(value) { officialUser = value },
+    fireSlotsChanged() { subscriptions.forEach((entry) => entry.listener()) },
+    get: (name) => (name === 'sessions' ? sessions : name === 'slots' ? slots : name === 'uiConversation' ? uiConversation : undefined),
     effect: (fn) => { effects.push(fn()) },
   }
 }
@@ -251,20 +283,25 @@ bundle.apply(ctx)
 
 // --- the merge itself -------------------------------------------------------
 // One activation must wire BOTH features, in the order applyAll defines them.
+// The `user`-node takeover is NOT an inject row any more: it installs from the
+// entry-mutation watch, because the official renderer registers later.
 loose.deepEqual(
   ctx.registrations.filter((entry) => entry.via === 'inject').map((entry) => entry.name),
   [
-    'conversation.chat.node',
     'conversation.chat.user-actions',
     'conversation.chat.assistant-actions',
     'conversation.session.header.utilities',
   ],
-  'rollback registers its three slots and the rail adds its header toggle',
+  'rollback registers its action slots and the rail adds its header toggle',
 )
 const takeover = ctx.registrations.filter((entry) => entry.via === 'register' && entry.name === 'conversation.chat.node')
 assert.equal(takeover.length, 1, 'rollback registers exactly one user-node takeover')
 assert.equal(takeover[0].key, 'user')
 assert.equal(takeover[0].priority, -1, 'the takeover keeps its priority — the rail did not shadow it')
+assert.ok(
+  ctx.subscriptions.some((entry) => entry.name === 'conversation.chat.node'),
+  'the takeover watches conversation.chat.node entry mutations',
+)
 
 assert.equal(rendered.length, 1, 'the rail mounts exactly once')
 const store = rendered[0].props.store
@@ -299,6 +336,47 @@ assert.equal(rendered.length, 2, 'a fresh activation mounts its own rail')
 const otherStore = rendered[1].props.store
 assert.equal(otherStore.getSnapshot().sessionId, 's2')
 loose.deepEqual(otherStore.getSnapshot().rows.map((row) => row.text), ['另一个会话'])
+
+// The official `user` renderer can register AFTER this plugin activates (both
+// halves only wait on slots/sessions), so the takeover must install on a later
+// entry mutation instead of a one-shot lookup at apply time.
+const lateCtx = makeCtx(
+  makeSessions('s6', [{ turn: 1, content: [text('晚到的官方渲染器')] }], { hasMore: false }),
+  { officialUser: false },
+)
+bundle.apply(lateCtx)
+assert.equal(
+  lateCtx.registrations.filter((entry) => entry.via === 'register' && entry.name === 'conversation.chat.node').length,
+  0,
+  'no takeover while the official renderer is absent',
+)
+lateCtx.setOfficialUser(true)
+lateCtx.fireSlotsChanged()
+const lateTakeover = lateCtx.registrations.filter((entry) => entry.via === 'register' && entry.name === 'conversation.chat.node')
+assert.equal(lateTakeover.length, 1, 'a later official renderer still gets shadowed')
+assert.equal(lateTakeover[0].priority, -1)
+assert.ok(
+  lateCtx.registrations.some((entry) => entry.via === 'inject' && entry.name === 'conversation.chat.user-actions'),
+  'the edit action still targets the slot the takeover declares',
+)
+
+// The rail reads the per-session Chat target, not the session snapshot: on this
+// DSH build the session snapshot carries no `chat` field at all.
+const targetOnlySessions = makeSessions('s7', [
+  { turn: 1, content: [text('目标源第一轮')] },
+  { turn: 2, content: [text('目标源第二轮')] },
+], { hasMore: false, omitChat: true })
+const targetOnlyCtx = makeCtx(targetOnlySessions, {
+  chat: makeChat([{ turn: 1, content: [text('目标源第一轮')] }, { turn: 2, content: [text('目标源第二轮')] }]),
+})
+bundle.apply(targetOnlyCtx)
+assert.ok(targetOnlyCtx.chatTargetNames.includes('chat'), 'the rail resolves the per-session chat view target')
+const targetOnlyStore = rendered[rendered.length - 1].props.store
+loose.deepEqual(
+  targetOnlyStore.getSnapshot().rows.map((row) => row.text),
+  ['目标源第一轮', '目标源第二轮'],
+  'rows come from the chat target even when the session snapshot has no chat field',
+)
 
 /**
  * A scroll host with one row per loaded Chat Node. Row tops are viewport
@@ -398,7 +476,7 @@ hostileCtx.slots.register = (options, component) => {
 assert.doesNotThrow(() => bundle.apply(hostileCtx), 'a throwing rail is contained; the rollback half survives it')
 
 // Disposal runs every effect disposer without throwing.
-const disposables = [ctx, otherCtx, midCtx, tailCtx, hostileCtx]
+const disposables = [ctx, otherCtx, midCtx, tailCtx, hostileCtx, lateCtx, targetOnlyCtx]
 disposables.forEach((scope) => scope.effects.forEach((dispose) => { if (typeof dispose === 'function') dispose() }))
 assert.ok(Array.isArray(store.getSnapshot().rows), 'disposal leaves the store readable')
 

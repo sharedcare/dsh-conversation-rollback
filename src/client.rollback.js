@@ -152,9 +152,18 @@ window.__ModuleLoader__.load({
 				box-shadow: 0 12px 40px rgba(0, 0, 0, 0.24);
 			}
 		`;
-		function userTextForTurn(snapshot, turnNumber) {
+		/**
+		 * Read the Chat target snapshot inside a slot entry. DSH 0.1.2-rc.1 exposes
+		 * the Chat target as the session-scope `chat` hook (`useChat`) rather than a
+		 * `chat` field on the session snapshot, so prefer the hook and keep the
+		 * legacy shape as a fallback for older builds (one bundle spans both).
+		 */
+		function chatSelector(props, select) {
+			if (typeof props.useChat === "function") return props.useChat(select);
+			return props.useSession((snapshot) => select(snapshot && snapshot.chat));
+		}
+		function userTextForTurn(chat, turnNumber) {
 			if (turnNumber === null) return null;
-			const chat = snapshot && snapshot.chat;
 			if (!chat || !chat.locations || !chat.nodes) return null;
 			const keys = chat.locations.getTurn(turnNumber);
 			let found = false;
@@ -173,9 +182,8 @@ window.__ModuleLoader__.load({
 			}
 			return found ? parts.join("\n") : null;
 		}
-		function turnHasImage(snapshot, turnNumber) {
+		function turnHasImage(chat, turnNumber) {
 			if (turnNumber === null) return false;
-			const chat = snapshot && snapshot.chat;
 			if (!chat || !chat.locations || !chat.nodes) return false;
 			for (const key of chat.locations.getTurn(turnNumber)) {
 				const node = chat.nodes.get(key);
@@ -188,9 +196,8 @@ window.__ModuleLoader__.load({
 			}
 			return false;
 		}
-		function finalAssistantFact(snapshot, messageId, fact) {
+		function finalAssistantFact(chat, messageId, fact) {
 			if (!messageId) return null;
-			const chat = snapshot && snapshot.chat;
 			if (!chat || !chat.order || !chat.nodes) return null;
 			for (const key of chat.order) {
 				const node = chat.nodes.get(key);
@@ -263,15 +270,55 @@ window.__ModuleLoader__.load({
 			 * original component's returned element is cloned with a wrapped
 			 * `actions` callback, so the edit action is injected into the same
 			 * MessageIconActions row as Copy — without patching ui-conversation.
+			 *
+			 * The official renderer is registered by ui-chat *after* this plugin
+			 * activates (both wait only on `slots`/`sessions`), so a one-shot lookup
+			 * at apply time misses it. Track the slot's entry mutations instead: the
+			 * takeover installs as soon as an official renderer is visible, whatever
+			 * the activation order.
 			 */
-			const originalUserEntry = slots.entries("conversation.chat.node").find((entry) => entry.options.key === "user");
-			const OriginalUserMessageNodeView = originalUserEntry && originalUserEntry.component;
+			let OriginalUserMessageNodeView;
+			let disposeUserTakeover = null;
+			function officialUserNodeView() {
+				for (const entry of slots.entries("conversation.chat.node")) {
+					if (entry.options.key !== "user") continue;
+					if (entry.component === UserMessageNodeViewWithActions) continue;
+					if (entry.component !== undefined) return entry.component;
+				}
+				return undefined;
+			}
+			function hasUserTakeover() {
+				return slots.entries("conversation.chat.node").some((entry) => entry.component === UserMessageNodeViewWithActions);
+			}
+			function reconcileUserTakeover() {
+				const original = officialUserNodeView();
+				if (original === undefined) return;
+				OriginalUserMessageNodeView = original;
+				if (hasUserTakeover()) return;
+				disposeUserTakeover = slots.register(
+					{
+						name: "conversation.chat.node",
+						key: "user",
+						priority: -1,
+						locale: "conversation",
+						children: {
+							"conversation.chat.user-actions": {
+								kind: "list",
+								scope: "session"
+							}
+						}
+					},
+					UserMessageNodeViewWithActions
+				);
+			}
 			function UserMessageNodeViewWithActions(props) {
 				const { renderSlot, node } = props;
-				const InnerUserMessageNodeView = OriginalUserMessageNodeView && OriginalUserMessageNodeView.type ? OriginalUserMessageNodeView.type : OriginalUserMessageNodeView;
+				const original = OriginalUserMessageNodeView;
+				if (original === undefined) return null;
+				const InnerUserMessageNodeView = original && original.type ? original.type : original;
 				const rendered = typeof InnerUserMessageNodeView === "function" ? InnerUserMessageNodeView(props) : null;
 				if (rendered === null || !React.isValidElement(rendered)) {
-					return React.createElement(OriginalUserMessageNodeView, props);
+					return React.createElement(original, props);
 				}
 				const originalActions = rendered.props.actions;
 				const location = node && node.location;
@@ -292,8 +339,7 @@ window.__ModuleLoader__.load({
 				const [notice, setNotice] = React.useState(null);
 				const [editing, setEditing] = React.useState(false);
 				const [draft, setDraft] = React.useState("");
-				const isLatest = props.useSession((snapshot) => {
-					const chat = snapshot && snapshot.chat;
+				const isLatest = chatSelector(props, (chat) => {
 					if (!chat || turnNumber === null) return true;
 					const keys = chat.locations ? chat.locations.getTurn(turnNumber) : [];
 					const lastKey = keys.length > 0 ? keys[keys.length - 1] : undefined;
@@ -301,8 +347,8 @@ window.__ModuleLoader__.load({
 					if (lastKey === undefined || !order || order.length === 0) return true;
 					return order[order.length - 1] === lastKey;
 				});
-				const editableText = props.useSession((snapshot) => userTextForTurn(snapshot, turnNumber));
-				const hasImage = props.useSession((snapshot) => turnHasImage(snapshot, turnNumber));
+				const editableText = chatSelector(props, (chat) => userTextForTurn(chat, turnNumber));
+				const hasImage = chatSelector(props, (chat) => turnHasImage(chat, turnNumber));
 				const running = props.useSession((snapshot) => Boolean(snapshot && snapshot.running));
 				React.useEffect(() => {
 					if (!armed || timer === undefined) return;
@@ -592,14 +638,13 @@ window.__ModuleLoader__.load({
 
 			function RollbackAssistantAction(props) {
 				const messageId = props.messageId;
-				const turnNumber = props.useSession((snapshot) => finalAssistantFact(snapshot, messageId, "turn"));
-				const seq = props.useSession((snapshot) => finalAssistantFact(snapshot, messageId, "seq"));
+				const turnNumber = chatSelector(props, (chat) => finalAssistantFact(chat, messageId, "turn"));
+				const seq = chatSelector(props, (chat) => finalAssistantFact(chat, messageId, "seq"));
 				const [armed, setArmed] = React.useState(false);
 				const [busy, setBusy] = React.useState(false);
 				const [notice, setNotice] = React.useState(null);
 				const running = props.useSession((snapshot) => Boolean(snapshot && snapshot.running));
-				const isLatest = props.useSession((snapshot) => {
-					const chat = snapshot && snapshot.chat;
+				const isLatest = chatSelector(props, (chat) => {
 					if (!chat || turnNumber === null) return true;
 					const keys = chat.locations ? chat.locations.getTurn(turnNumber) : [];
 					const lastKey = keys.length > 0 ? keys[keys.length - 1] : undefined;
@@ -663,23 +708,16 @@ window.__ModuleLoader__.load({
 				}, label);
 			}
 
-			if (OriginalUserMessageNodeView !== undefined) {
-				slots.inject("conversation.chat.node", () => slots.register(
-					{
-						name: "conversation.chat.node",
-						key: "user",
-						priority: -1,
-						locale: "conversation",
-						children: {
-							"conversation.chat.user-actions": {
-								kind: "list",
-								scope: "session"
-							}
-						}
-					},
-					UserMessageNodeViewWithActions
-				));
-			}
+			// Shadow the official `user` renderer as soon as one exists: the immediate
+			// reconcile covers the already-registered case, the entry subscription
+			// covers registration that lands later (the normal order on this build).
+			ctx.effect(() => slots.subscribe("conversation.chat.node", reconcileUserTakeover), "conversation-rollback: user node takeover watch");
+			ctx.effect(() => () => {
+				if (disposeUserTakeover === null) return;
+				disposeUserTakeover();
+				disposeUserTakeover = null;
+			}, "conversation-rollback: user node takeover lifetime");
+			reconcileUserTakeover();
 			slots.inject("conversation.chat.user-actions", () => slots.register(
 				{
 					name: "conversation.chat.user-actions",

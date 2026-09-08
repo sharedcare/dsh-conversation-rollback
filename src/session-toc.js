@@ -316,11 +316,16 @@
 
     /**
      * Session-bound outline store. It is the single writer of the rail's state:
-     * the session snapshot feeds `rows/hasMore/loadingOlder`, the UI writes
-     * `pinned/query/activeKey`. `getSnapshot()` is reference-stable between
-     * notifications so React can consume it through useSyncExternalStore.
+     * the Chat target feeds `rows`, the session snapshot feeds
+     * `hasMore/loadingOlder`, the UI writes `pinned/query/activeKey`.
+     * `getSnapshot()` is reference-stable between notifications so React can
+     * consume it through useSyncExternalStore.
+     *
+     * `chatTargetFor(binding)` resolves the session's Chat target source
+     * (DSH >= 0.1.2-rc.1 exposes the Chat target as a per-session view target;
+     * older builds carried it on the session snapshot as `snapshot.chat`).
      */
-    function createStore(sessions, timer) {
+    function createStore(sessions, timer, chatTargetFor) {
       var listeners = {}
       var nextListener = 1
       var state = {
@@ -335,7 +340,9 @@
       }
       var boundId = null
       var boundSession = null
+      var boundChat = null
       var unsubSession = null
+      var unsubChat = null
       var unsubList = null
       var retryTimer = null
       var retryBudget = 40
@@ -384,6 +391,24 @@
         }
       }
 
+      /** Latest Chat target snapshot: the live view target first, the legacy
+       * session-snapshot `chat` field as a fallback for older builds. */
+      function chatSnapshot() {
+        if (boundChat) {
+          try {
+            var chat = boundChat.getSnapshot()
+            if (chat) return chat
+          } catch (error) {}
+        }
+        if (!boundSession) return null
+        try {
+          var snapshot = boundSession.getSnapshot()
+          return (snapshot && snapshot.chat) || null
+        } catch (error) {
+          return null
+        }
+      }
+
       function refresh() {
         if (!boundSession || disposed) return
         var snapshot = null
@@ -392,7 +417,7 @@
         } catch (error) {
           return
         }
-        var rows = buildOutline(snapshot && snapshot.chat)
+        var rows = buildOutline(chatSnapshot())
         set({
           rows: sameRows(state.rows, rows) ? state.rows : rows,
           hasMore: !!(snapshot && snapshot.hasMore),
@@ -407,7 +432,14 @@
           } catch (error) {}
           unsubSession = null
         }
+        if (unsubChat) {
+          try {
+            unsubChat()
+          } catch (error) {}
+          unsubChat = null
+        }
         boundSession = null
+        boundChat = null
       }
 
       function bind(id) {
@@ -433,6 +465,21 @@
             })
           } catch (error) {
             console.error(LOG, 'subscribe failed', error)
+          }
+        }
+        // The Chat target lives outside the session snapshot on this build, so the
+        // outline follows its own source; subscribing also activates the target.
+        if (binding && typeof chatTargetFor === 'function') {
+          try {
+            var target = chatTargetFor(binding)
+            if (target && typeof target.subscribe === 'function' && typeof target.getSnapshot === 'function') {
+              boundChat = target
+              unsubChat = target.subscribe(function () {
+                refresh()
+              })
+            }
+          } catch (error) {
+            console.error(LOG, 'chat target unavailable', error)
           }
         }
         set({ sessionId: boundId, rows: [], hasMore: false, loadingOlder: false, activeKey: null, error: null })
@@ -967,7 +1014,13 @@
         return
       }
 
-      var store = createStore(sessions, ctx.get('timer'))
+      var store = createStore(sessions, ctx.get('timer'), function (binding) {
+        // The Conversation service owns the per-session view targets; resolve it
+        // lazily, because it may activate after this plugin does.
+        var uiConversation = ctx.get('uiConversation')
+        if (!uiConversation || typeof uiConversation.binding !== 'function') return null
+        return uiConversation.binding(binding).target('chat')
+      })
 
       try {
         // Official style ownership: `style[data-plugin="<package name>"]` is what

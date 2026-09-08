@@ -6,6 +6,13 @@ right-edge **session outline rail** for the DeepSeek Harness (DSH) Web UI.
 - **v1.3.0** — rollback + edit-and-resend (the package's original scope).
 - **v1.4.0** — merges the standalone `dsh-session-toc` outline rail into this
   package: one plugin, one client bundle, one install.
+- **v1.4.1** — compatibility with the DSH 0.1.2-rc.1 client contract: the Chat
+  target is read through the session-scope `chat` hook (`useChat`) instead of
+  `useSession(s => s.chat)`, and the `user`-node takeover installs from an
+  entry-mutation watch instead of a one-shot lookup at apply time. On 1.4.0 both
+  features stayed invisible (no error) because the session snapshot no longer
+  carries `chat` and the official renderer registers after this plugin
+  activates. See 「v1.4.1：为什么 1.4.0 在这版 DSH 上什么都没显示」.
 
 [English](#english) · [中文](#中文)
 
@@ -62,6 +69,35 @@ right-edge **session outline rail** for the DeepSeek Harness (DSH) Web UI.
 - Edit: `{ "operation": "edit", "sessionId": "...", "turn": <turn number>, "text": "..." }`
 
 The outline rail is purely client-side and needs no endpoint.
+
+### v1.4.1: why 1.4.0 rendered nothing on DSH 0.1.2-rc.1
+
+On DSH 0.1.2-rc.1 (DSH Desktop 2.0.5) the 1.4.0 client half activated — styles
+injected, rail header toggle registered — but **no** edit button, rollback
+button or rail appeared, and the console stayed silent. Two client-contract
+changes caused it:
+
+1. **Chat data moved off the session snapshot.** `useSession(snapshot =>
+   snapshot.chat)` always saw `undefined`, because the session snapshot
+   (`dsh-api-session-controller`'s `buildSnapshot()`) has no `chat` field; the
+   Chat target is now the session-scope `chat` hook (`useChat`, provided by
+   `dsh-client-ui-chat` via `ctx.uiSession.provide`). Every chat projection —
+   `finalAssistantFact`, `userTextForTurn`, `turnHasImage`, the rail's
+   `buildOutline` — therefore returned empty, and every component silently
+   returned `null`. v1.4.1 reads the target through `useChat` (with the legacy
+   field as fallback) and the rail subscribes to the per-session view target
+   (`uiConversation.binding(binding).target('chat')`).
+2. **The `user`-node takeover lost a registration race.**
+   `conversation.chat.user-actions` does not exist in this build; the takeover
+   is what declares it. 1.4.0 looked the official `user` renderer up once at
+   apply time, but this plugin only injects `slots`/`sessions`, so it activates
+   before ui-chat registers that renderer — the lookup missed and the edit
+   action was never registered. v1.4.1 watches
+   `slots.subscribe('conversation.chat.node', …)` and installs the takeover as
+   soon as an official renderer is visible, whatever the activation order.
+
+Both halves keep the older-build shape as a fallback, so one bundle spans
+0.1.2-rc.1 and the builds that carried `snapshot.chat`.
 
 ### Requirements
 
@@ -137,10 +173,10 @@ Option B — install a packed tarball:
 
 ```sh
 npm pack
-dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.0.tgz
+dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.1.tgz
 ```
 
-(The filename is whatever `npm pack` prints — `1.4.0` for the current
+(The filename is whatever `npm pack` prints — `1.4.1` for the current
 version.)
 
 #### 4. Migrating from 1.3.0 (or from the standalone session-toc plugin)
@@ -176,15 +212,20 @@ version.)
    `id: conversation-rollback`.
 
 3. Desktop app (no `--dump-config` on the shell — probe the served bundle
-   directly; `dsh-toc-root` is the rail's stylesheet root class):
+   directly from the running page; `dsh-toc-root` is the rail's stylesheet root
+   class). The module loader serves one combo URL per graph row
+   (`/plugins/??<id>/client.js&rev=<rev>`, rev from `window.__DSH_BOOT__`), so
+   ask the page instead of guessing the path:
 
-   ```sh
-   curl -s "http://127.0.0.1:<port>/plugins/conversation-rollback/client.js" | grep -c dsh-toc-root
+   ```js
+   // DevTools console on the DSH page (the page already holds the auth cookie)
+   await fetch(__DSH_BOOT__.entries.find(e => e.id === 'conversation-rollback').url)
+     .then(r => r.text())
+     .then(t => ({ status: 200, hasRailCss: t.includes('dsh-toc-root'), bytes: t.length }))
    ```
 
-   Expect `200` and a non-zero match count. If the rail is missing but the
-   rollback buttons work, the client bundle is stale — hard-refresh the
-   browser page and retry.
+   Expect `hasRailCss: true`. If the rail is missing but the rollback buttons
+   work, the client bundle is stale — hard-refresh the browser page and retry.
 
 ### Uninstall
 
@@ -349,6 +390,30 @@ will not be rolled back automatically.
 - GitHub 安装和本地 clone 需要 `git`；只有使用 `npm pack` 方式时才需要
   `npm`。
 
+### v1.4.1：为什么 1.4.0 在这版 DSH 上什么都没显示
+
+DSH 0.1.2-rc.1（DSH Desktop 2.0.5）上，1.4.0 的客户端半身确实激活了（样式注
+入了、rail 的头部按钮注册了），但 ✎ 修改、↩ 回退、右侧 rail 一个都不出现，
+控制台也**没有任何报错**。原因是这版客户端契约有两处变化：
+
+1. **Chat 数据不再挂在 session 快照上**：`useSession(s => s.chat)` 恒为
+   `undefined`——session 快照（`dsh-api-session-controller` 的
+   `buildSnapshot()`）没有 `chat` 字段，Chat 目标改由会话级 hook `useChat`
+   暴露（`dsh-client-ui-chat` 的 `ctx.uiSession.provide`）。于是
+   `finalAssistantFact` / `userTextForTurn` / `turnHasImage` / rail 的
+   `buildOutline` 全部返回空，组件静默 `return null`。1.4.1 改用 `useChat`
+   （旧字段保留为回退），rail 改为订阅每会话的视图目标
+   （`uiConversation.binding(binding).target('chat')`）。
+2. **`user` 节点接管输掉了一次注册竞态**：这版没有
+   `conversation.chat.user-actions`，该 slot 正是由接管自己声明的。1.4.0 在
+   apply 时只查一次官方 `user` 渲染器，而本插件只 inject `slots`/`sessions`，
+   激活早于 ui-chat 注册该渲染器——查询落空，修改按钮从未注册。1.4.1 改为
+   监听 `slots.subscribe('conversation.chat.node', …)`，一旦看见官方渲染器就
+   安装接管，不再依赖激活顺序。
+
+两半都保留了旧版形态作为回退，因此同一个 bundle 同时兼容 0.1.2-rc.1 与仍带
+`snapshot.chat` 的版本。
+
 ### 安装
 
 #### 1. 先确认你在用哪个 profile
@@ -411,10 +476,10 @@ dsh plugin --profile <web|desktop> add link:$PWD
 
 ```sh
 npm pack
-dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.0.tgz
+dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.1.tgz
 ```
 
-（文件名以 `npm pack` 输出为准——当前版本是 `1.4.0`。）
+（文件名以 `npm pack` 输出为准——当前版本是 `1.4.1`。）
 
 #### 4. 从 1.3.0 升级（或从独立 session-toc 插件迁移）
 
@@ -447,15 +512,20 @@ dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.0.tgz
 
    配置 dump 中应出现 bundle 分节，以及 `id: conversation-rollback` 条目。
 
-3. Desktop（外壳没有 `--dump-config`——直接探测被服务的 bundle；
-   `dsh-toc-root` 是 rail 样式表的根类名）：
+3. Desktop（外壳没有 `--dump-config`——在运行中的页面里直接探测被服务的
+   bundle；`dsh-toc-root` 是 rail 样式表的根类名）。模块加载器每个 entry
+   只服务一个 combo URL（`/plugins/??<id>/client.js&rev=<rev>`，rev 取自
+   `window.__DSH_BOOT__`），所以不要猜路径，问页面：
 
-   ```sh
-   curl -s "http://127.0.0.1:<port>/plugins/conversation-rollback/client.js" | grep -c dsh-toc-root
+   ```js
+   // DSH 页面上的 DevTools 控制台（页面本身已带 auth cookie）
+   await fetch(__DSH_BOOT__.entries.find(e => e.id === 'conversation-rollback').url)
+     .then(r => r.text())
+     .then(t => ({ status: 200, hasRailCss: t.includes('dsh-toc-root'), bytes: t.length }))
    ```
 
-   期望返回 `200` 且匹配数非 0。若回退按钮正常但 rail 缺失，说明客户端
-   bundle 是旧版——强制刷新浏览器页面后再试。
+   期望 `hasRailCss: true`。若回退按钮正常但 rail 缺失，说明客户端 bundle
+   是旧版——强制刷新浏览器页面后再试。
 
 ### 卸载
 
