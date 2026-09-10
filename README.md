@@ -13,6 +13,13 @@ right-edge **session outline rail** for the DeepSeek Harness (DSH) Web UI.
   features stayed invisible (no error) because the session snapshot no longer
   carries `chat` and the official renderer registers after this plugin
   activates. See 「v1.4.1：为什么 1.4.0 在这版 DSH 上什么都没显示」.
+- **v1.4.2** — host compatibility with DSH Desktop 2.0.7 (dsh 0.1.5-rc.1):
+  `@deepseek-ai/dsh-session` stopped exporting the physical row codec
+  (`decodeStorageRecord`/`packChunkRuns`), the persistence `inspect()` seam was
+  replaced by the read-handle seam, and the live durable cursor moved from
+  `persistence.coordinator` onto the backend tracker's write handle. The codec
+  is now vendored in `lib/chunk-rows.js` and both host paths read the new APIs.
+  See 「v1.4.2：为什么 1.4.1 在 Desktop 2.0.7 上整个插件树加载失败」.
 
 [English](#english) · [中文](#中文)
 
@@ -99,6 +106,37 @@ changes caused it:
 Both halves keep the older-build shape as a fallback, so one bundle spans
 0.1.2-rc.1 and the builds that carried `snapshot.chat`.
 
+### v1.4.2: why 1.4.1 failed to load at all on DSH 0.1.5-rc.1
+
+On DSH 0.1.5-rc.1 (DSH Desktop 2.0.7) the plugin tree failed to load with
+`The requested module '@deepseek-ai/dsh-session' does not provide an export
+named 'decodeStorageRecord'` — an ESM link error, so the whole plugin never
+activated. Three host-contract changes caused it:
+
+1. **The physical row codec left the public surface.** `decodeStorageRecord`
+   and `packChunkRuns` still ship inside `@deepseek-ai/dsh-session`
+   (`lib/types/chunk-rows.js`) but are no longer reachable through the root
+   entry, the `./types` subpath, or the package `exports` map. The rollback
+   host now carries a vendored copy (`lib/chunk-rows.js`); the row vocabulary
+   itself is unchanged — the v3 format decodes these rows through the frozen
+   v0 codec — so an in-place rewrite stays format-correct.
+   `interruptedTurnClosers` is still a public export and is imported from the
+   package as before.
+2. **`persistence.inspect(id)` is gone.** Stored sessions are now read through
+   the handle seam: `open(id, 'read')` + `handle.read()` (the full contiguous
+   log), with the stored header on the handle. The plugin closes the handle on
+   every path.
+3. **The live durable cursor moved.** `persistence.coordinator.states` no
+   longer exists; the cursor now lives on the backend tracker's live write
+   handle (`persistence.tracker.writers`). The live rollback surgery rewinds
+   that handle's cursor — and its `observedLength` guard, so a later read
+   cannot reject the shortened log as "shrunk". The Session event log also
+   moved from `session.events` to `session.log`; the host reads whichever the
+   running build exposes.
+
+The host route and both features are otherwise unchanged; the client bundle
+does not need a rebuild for this fix.
+
 ### Requirements
 
 - A DSH installation with the `web` profile (`dsh web`) **or** the DSH
@@ -173,10 +211,10 @@ Option B — install a packed tarball:
 
 ```sh
 npm pack
-dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.1.tgz
+dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.2.tgz
 ```
 
-(The filename is whatever `npm pack` prints — `1.4.1` for the current
+(The filename is whatever `npm pack` prints — `1.4.2` for the current
 version.)
 
 #### 4. Migrating from 1.3.0 (or from the standalone session-toc plugin)
@@ -248,9 +286,11 @@ inputs and `lib/` the committed product.
 | `src/client.rollback.js` | rollback client bundle (upstream code + the single `FORK DEVIATION` marker below) |
 | `src/session-toc.js` | outline rail factory body (bundle shell stripped) |
 | `lib/client.js` | product of `pnpm run build` — **do not edit by hand** |
-| `lib/index.js` | host side; identical to the 1.3.0 host code |
+| `lib/index.js` | host side (route, rewrite, live surgery) |
+| `lib/chunk-rows.js` | vendored port of dsh-session's internal physical-row codec (see v1.4.2 above) |
 | `tools/merge-client.mjs` | splice / unsplice tool |
-| `test/smoke.mjs` | browserless smoke test (`pnpm test`) |
+| `test/chunk-rows.mjs` | host codec round-trip test (`pnpm test`) |
+| `test/smoke.mjs` | browserless client smoke test (`pnpm test`) |
 
 ```sh
 pnpm run build        # src/client.rollback.js + src/session-toc.js -> lib/client.js
@@ -414,6 +454,31 @@ DSH 0.1.2-rc.1（DSH Desktop 2.0.5）上，1.4.0 的客户端半身确实激活�
 两半都保留了旧版形态作为回退，因此同一个 bundle 同时兼容 0.1.2-rc.1 与仍带
 `snapshot.chat` 的版本。
 
+### v1.4.2：为什么 1.4.1 在 Desktop 2.0.7 上整个插件树加载失败
+
+DSH 0.1.5-rc.1（DSH Desktop 2.0.7）上插件树直接加载失败：
+`The requested module '@deepseek-ai/dsh-session' does not provide an export
+named 'decodeStorageRecord'`——这是 ESM 链接期错误，插件根本没有激活。原因
+是宿主契约有三处变化：
+
+1. **物理行编解码器离开了公开面**：`decodeStorageRecord` / `packChunkRuns`
+   仍随包发布（`lib/types/chunk-rows.js`），但根入口、`./types` 子路径和
+   `exports` 映射都不再暴露它们。宿主半身改为内置移植副本
+   （`lib/chunk-rows.js`）；行词汇本身没有变——v3 格式仍通过冻结的 v0
+   codec 解码这些行——所以原地重写日志依旧符合格式。
+   `interruptedTurnClosers` 仍是公开导出，照旧从包导入。
+2. **`persistence.inspect(id)` 已不存在**：已存储会话改走 handle 通道——
+   `open(id, 'read')` + `handle.read()`（完整连续日志），存储头挂在 handle
+   上；插件在所有路径上都会关闭 handle。
+3. **live durable cursor 搬家**：`persistence.coordinator.states` 已删除，
+   cursor 现在挂在后端 tracker 的 live write handle 上
+   （`persistence.tracker.writers`）。live 回退手术会同步回绕该 handle 的
+   cursor 及其 `observedLength` 守卫，避免后续读取把截短后的日志判为
+   "shrunk"。Session 事件日志也从 `session.events` 移到 `session.log`，
+   宿主半身按运行版本二选一读取。
+
+路由与两项功能其余不变；本次修复不需要重建客户端 bundle。
+
 ### 安装
 
 #### 1. 先确认你在用哪个 profile
@@ -476,10 +541,10 @@ dsh plugin --profile <web|desktop> add link:$PWD
 
 ```sh
 npm pack
-dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.1.tgz
+dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.2.tgz
 ```
 
-（文件名以 `npm pack` 输出为准——当前版本是 `1.4.1`。）
+（文件名以 `npm pack` 输出为准——当前版本是 `1.4.2`。）
 
 #### 4. 从 1.3.0 升级（或从独立 session-toc 插件迁移）
 
@@ -547,8 +612,10 @@ dsh plugin --profile <web|desktop> remove conversation-rollback
 | `src/client.rollback.js` | rollback 的 client bundle（上游原文 + 下方唯一一处 `FORK DEVIATION`） |
 | `src/session-toc.js` | rail 的 factory body（外壳已剥掉） |
 | `lib/client.js` | `pnpm run build` 的产物，**不要手改** |
-| `lib/index.js` | 宿主半，与 1.3.0 的宿主代码一致 |
+| `lib/index.js` | 宿主半（路由、重写、live 手术） |
+| `lib/chunk-rows.js` | 内置移植的 dsh-session 内部物理行编解码器（见上方 v1.4.2） |
 | `tools/merge-client.mjs` | 拼接 / 反拼接工具 |
+| `test/chunk-rows.mjs` | 宿主 codec 往返测试（`pnpm test`） |
 | `test/smoke.mjs` | 无浏览器冒烟测试（`pnpm test`） |
 
 ```sh

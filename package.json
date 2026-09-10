@@ -1,20 +1,22 @@
 {
   "name": "conversation-rollback",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Codex-style in-place conversation rollback and edit-and-resend for the DeepSeek Harness web GUI, plus a right-edge outline rail (session table of contents) whose search pages backwards through history until it matches",
   "type": "module",
   "main": "lib/index.js",
   "scripts": {
     "build": "node tools/merge-client.mjs",
     "build:strip": "node tools/merge-client.mjs --strip",
-    "test": "node --check lib/client.js && node --check lib/index.js && node test/smoke.mjs"
+    "test": "node --check lib/chunk-rows.js && node --check lib/client.js && node --check lib/index.js && node test/chunk-rows.mjs && node test/smoke.mjs"
   },
   "exports": {
     ".": "./lib/index.js",
     "./client": "./lib/client.js",
+    "./chunk-rows": "./lib/chunk-rows.js",
     "./package.json": "./package.json"
   },
   "files": [
+    "lib/chunk-rows.js",
     "lib/index.js",
     "lib/client.js",
     "cordis.patch.yml",
