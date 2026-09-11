@@ -97,7 +97,9 @@ const windowStub = {
 
 const reactStub = {
   createElement: (type, props, ...children) => ({ type, props, children }),
-  useSyncExternalStore: () => null,
+  // The real hook returns the current snapshot on the first render; the stub
+  // does the same so a component under test can be invoked directly.
+  useSyncExternalStore: (subscribe, getSnapshot) => getSnapshot(),
   useState: (initial) => [initial, () => {}],
   useRef: (initial) => ({ current: initial }),
   useMemo: (factory) => factory(),
@@ -237,8 +239,8 @@ function makeCtx(sessions, options = {}) {
       callback()
       return () => {}
     },
-    register(options) {
-      registrations.push({ via: 'register', name: options.name, id: options.id, key: options.key, priority: options.priority })
+    register(options, component) {
+      registrations.push({ via: 'register', name: options.name, id: options.id, key: options.key, priority: options.priority, order: options.order, component })
       return () => {}
     },
     subscribe(name, listener) {
@@ -252,6 +254,15 @@ function makeCtx(sessions, options = {}) {
       return [{ options: { key: 'user' }, component: function OriginalUserMessageNodeView() { return null } }]
     },
   }
+  const localeListeners = new Set()
+  let activeLocale = options.locale === undefined ? 'zh' : options.locale
+  const locale = {
+    getSnapshot: () => ({ active: activeLocale, revision: 0 }),
+    subscribe(listener) {
+      localeListeners.add(listener)
+      return () => localeListeners.delete(listener)
+    },
+  }
   return {
     effects,
     registrations,
@@ -260,7 +271,12 @@ function makeCtx(sessions, options = {}) {
     slots,
     setOfficialUser(value) { officialUser = value },
     fireSlotsChanged() { subscriptions.forEach((entry) => entry.listener()) },
-    get: (name) => (name === 'sessions' ? sessions : name === 'slots' ? slots : name === 'uiConversation' ? uiConversation : undefined),
+    /** Drive the harness language switch (the real one emits `locale/change` too). */
+    setLocale(next) {
+      activeLocale = next
+      localeListeners.forEach((listener) => listener())
+    },
+    get: (name) => (name === 'sessions' ? sessions : name === 'slots' ? slots : name === 'uiConversation' ? uiConversation : name === 'locale' ? locale : undefined),
     effect: (fn) => { effects.push(fn()) },
   }
 }
@@ -291,8 +307,9 @@ loose.deepEqual(
     'conversation.chat.user-actions',
     'conversation.chat.assistant-actions',
     'conversation.session.header.utilities',
+    'settings.general.item',
   ],
-  'rollback registers its action slots and the rail adds its header toggle',
+  'rollback registers its action slots, the rail adds its header toggle and the outline switch its settings row',
 )
 const takeover = ctx.registrations.filter((entry) => entry.via === 'register' && entry.name === 'conversation.chat.node')
 assert.equal(takeover.length, 1, 'rollback registers exactly one user-node takeover')
@@ -475,8 +492,147 @@ hostileCtx.slots.register = (options, component) => {
 }
 assert.doesNotThrow(() => bundle.apply(hostileCtx), 'a throwing rail is contained; the rollback half survives it')
 
+// --- the outline switch (Settings -> General) --------------------------------
+// The preference is a real user setting (host settings namespace
+// `conversation-rollback`, persisted in settings.yaml). The client reaches it
+// through this plugin's own route, so the read/write contract below is what the
+// settings row, the rail and the header button all share.
+const visible = (state) => Boolean(state.outlineKnown && state.outline)
+
+const settingsRow = ctx.registrations.find((entry) => entry.via === 'register' && entry.name === 'settings.general.item')
+assert.ok(settingsRow, 'the outline switch registers one row on the settings General page')
+assert.equal(settingsRow.id, 'session-outline')
+assert.equal(settingsRow.order, 20, 'the row lands beside the built-in appearance rows')
+
+// This sandbox has no fetch at all: the read must fail closed to "known +
+// enabled", never to a hidden rail (a missing settings service is not an
+// instruction to remove a feature).
+const offline = store.getSnapshot()
+assert.equal(offline.outlineKnown, true, 'an unreachable settings route still resolves the preference')
+assert.equal(offline.outline, true, 'no reachable settings route leaves the rail at its default (on)')
+assert.equal(offline.outlineUnavailable, true, 'the row is told to report the missing settings service')
+assert.equal(visible(offline), true, 'the rail stays visible when the preference cannot be read')
+
+// With a reachable route: read on mount, write on demand, revision-guarded.
+const calls = []
+const replies = []
+const cached = new Map()
+windowStub.localStorage = {
+  getItem: (key) => (cached.has(key) ? cached.get(key) : null),
+  setItem: (key, value) => { cached.set(key, value) },
+  removeItem: (key) => { cached.delete(key) },
+}
+windowStub.fetch = (url, init) => {
+  calls.push({ url, body: JSON.parse(init.body) })
+  return Promise.resolve({ json: () => Promise.resolve(replies.shift()) })
+}
+const flush = () => new Promise((resolve) => setImmediate(resolve))
+
+replies.push({ ok: true, outline: false, revision: 4 })
+const prefCtx = makeCtx(makeSessions('s6', [{ turn: 1, content: [text('开关用例')] }], { hasMore: false }))
+bundle.apply(prefCtx)
+const prefStore = rendered[rendered.length - 1].props.store
+assert.equal(prefStore.getSnapshot().outlineKnown, false, 'the rail waits for the preference instead of flashing on')
+await flush()
+assert.equal(calls[0].body.operation, 'settings.get', 'the mount effect hydrates from the host setting')
+assert.equal(prefStore.getSnapshot().outline, false, 'a stored "off" keeps the rail off')
+assert.equal(visible(prefStore.getSnapshot()), false, 'a switched-off outline hides the rail and its header button')
+assert.equal(cached.get('conversation-rollback:outline'), '0', 'the value is mirrored locally')
+
+replies.push({ ok: true, outline: true, revision: 5 })
+assert.equal(await prefStore.setOutline(true), true, 'the switch reports a successful write')
+const write = calls[calls.length - 1]
+assert.equal(write.url, '/api/conversation-rollback')
+assert.equal(write.body.operation, 'settings.update')
+assert.equal(write.body.patch.outline, true)
+assert.equal(write.body.expectedRevision, 4, 'the write carries the revision it read')
+assert.equal(prefStore.getSnapshot().outline, true, 'the switch adopts the host response')
+assert.equal(prefStore.getSnapshot().outlineError, null)
+assert.equal(visible(prefStore.getSnapshot()), true, 'turning it back on brings the rail back')
+assert.equal(cached.get('conversation-rollback:outline'), '1')
+
+// A concurrent edit elsewhere must not silently diverge: the conflict is shown
+// and the document is re-read.
+replies.push({ ok: false, code: 'settings-conflict' })
+replies.push({ ok: true, outline: false, revision: 9 })
+assert.equal(await prefStore.setOutline(false), false, 'a revision conflict reports failure')
+await flush()
+await flush()
+assert.equal(calls[calls.length - 1].body.operation, 'settings.get', 'the conflict re-reads the settings document')
+assert.equal(prefStore.getSnapshot().outline, false, 'the re-read wins over the optimistic switch')
+
+// The row itself, rendered against the store it shares with the rail. With no
+// primitives build in this sandbox it must fall back to a plain checkbox — the
+// path a build without `@deepseek-ai/dsh-client-ui-primitives` would take.
+const collectNodes = (root) => {
+  const found = []
+  ;(function walk(node) {
+    if (node === null || node === undefined) return
+    if (Array.isArray(node)) { node.forEach(walk); return }
+    if (typeof node !== 'object') return
+    found.push(node)
+    walk(node.children)
+  })(root)
+  return found
+}
+const rowRecord = prefCtx.registrations.find((entry) => entry.via === 'register' && entry.name === 'settings.general.item')
+const rowLabel = () => collectNodes(rowRecord.component()).find((node) => node.props && node.props.className === 'dsh-toc-setting-title')
+const nodes = collectNodes(rowRecord.component())
+const checkbox = nodes.find((node) => node.type === 'input')
+assert.ok(checkbox, 'the row renders a control even without the harness switch primitive')
+assert.equal(checkbox.props.checked, prefStore.getSnapshot().outline, 'the control shows the live value')
+assert.equal(checkbox.props.disabled, false, 'the control is operable while the settings service answers')
+const title = rowLabel()
+assert.ok(title && title.children.includes('会话大纲'), 'the row carries its localized label')
+replies.push({ ok: true, outline: true, revision: 12 })
+checkbox.props.onChange({ target: { checked: true } })
+await flush()
+assert.equal(prefStore.getSnapshot().outline, true, 'clicking the row writes through the store to the host')
+assert.equal(calls[calls.length - 1].body.operation, 'settings.update', 'and that write is a settings.update')
+
+// --- the row follows the harness language switch -----------------------------
+// The dictionary is swapped IN PLACE on the object every component captured, and
+// the store emit is what re-renders mounted readers: without both, the settings
+// row keeps the language it was created in (the reported bug).
+prefCtx.setLocale('en-US')
+assert.ok(
+  rowLabel().children.includes('Session outline'),
+  'the settings row follows a language switch without a reload',
+)
+assert.equal(prefStore.getSnapshot().locale, 'en', 'the locale change pokes the store so mounted readers re-render')
+assert.ok(
+  collectNodes(rowRecord.component()).find((node) => node.props && node.props.className === 'dsh-toc-setting-desc')
+    .children.join('').startsWith('Show the prompt outline rail'),
+  'the row description follows too',
+)
+
+// The rail's own copy rides the same object: the header button re-renders in the
+// new language as well.
+const headerRecord = ctx.registrations.find((entry) => entry.via === 'register' && entry.name === 'conversation.session.header.utilities')
+assert.equal(headerRecord.component().props.title, '显示/隐藏会话目录', 'the header button starts in Chinese')
+ctx.setLocale('en')
+assert.equal(headerRecord.component().props.title, 'Show / hide session outline', 'the rail header button follows the language switch')
+ctx.setLocale('zh-CN')
+assert.equal(headerRecord.component().props.title, '显示/隐藏会话目录', 'and switches back')
+prefCtx.setLocale('zh')
+assert.ok(rowLabel().children.includes('会话大纲'), 'the row switches back to Chinese too')
+
+// The localStorage mirror is what keeps the NEXT load flash-free: a cold start
+// with a cached "off" hides the rail before the round-trip resolves.
+cached.set('conversation-rollback:outline', '0')
+replies.push({ ok: true, outline: false, revision: 10 })
+const cachedCtx = makeCtx(makeSessions('s7', [{ turn: 1, content: [text('缓存用例')] }], { hasMore: false }))
+bundle.apply(cachedCtx)
+const cachedStore = rendered[rendered.length - 1].props.store
+assert.equal(cachedStore.getSnapshot().outlineKnown, true, 'a cached value counts as known at first paint')
+assert.equal(visible(cachedStore.getSnapshot()), false, 'the cached "off" hides the rail immediately')
+await flush()
+assert.equal(cachedStore.getSnapshot().outline, false, 'the host read agrees with the cache')
+cached.delete('conversation-rollback:outline')
+windowStub.fetch = undefined
+
 // Disposal runs every effect disposer without throwing.
-const disposables = [ctx, otherCtx, midCtx, tailCtx, hostileCtx, lateCtx, targetOnlyCtx]
+const disposables = [ctx, otherCtx, midCtx, tailCtx, hostileCtx, lateCtx, targetOnlyCtx, prefCtx, cachedCtx]
 disposables.forEach((scope) => scope.effects.forEach((dispose) => { if (typeof dispose === 'function') dispose() }))
 assert.ok(Array.isArray(store.getSnapshot().rows), 'disposal leaves the store readable')
 

@@ -1,13 +1,13 @@
 {
   "name": "conversation-rollback",
-  "version": "1.4.2",
-  "description": "Codex-style in-place conversation rollback and edit-and-resend for the DeepSeek Harness web GUI, plus a right-edge outline rail (session table of contents) whose search pages backwards through history until it matches",
+  "version": "1.5.1",
+  "description": "Codex-style in-place conversation rollback and edit-and-resend for the DeepSeek Harness web GUI, plus a right-edge outline rail (session table of contents, switchable from Settings) whose search pages backwards through history until it matches",
   "type": "module",
   "main": "lib/index.js",
   "scripts": {
     "build": "node tools/merge-client.mjs",
     "build:strip": "node tools/merge-client.mjs --strip",
-    "test": "node --check lib/chunk-rows.js && node --check lib/client.js && node --check lib/index.js && node test/chunk-rows.mjs && node test/smoke.mjs"
+    "test": "node --check lib/chunk-rows.js && node --check lib/client.js && node --check lib/index.js && node test/chunk-rows.mjs && node test/host-route.mjs && node test/smoke.mjs"
   },
   "exports": {
     ".": "./lib/index.js",
@@ -22,6 +22,7 @@
     "cordis.patch.yml",
     "README.md"
   ],
+  "dependencies": {},
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"

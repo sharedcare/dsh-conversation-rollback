@@ -6,20 +6,20 @@ right-edge **session outline rail** for the DeepSeek Harness (DSH) Web UI.
 - **v1.3.0** — rollback + edit-and-resend (the package's original scope).
 - **v1.4.0** — merges the standalone `dsh-session-toc` outline rail into this
   package: one plugin, one client bundle, one install.
-- **v1.4.1** — compatibility with the DSH 0.1.2-rc.1 client contract: the Chat
-  target is read through the session-scope `chat` hook (`useChat`) instead of
-  `useSession(s => s.chat)`, and the `user`-node takeover installs from an
-  entry-mutation watch instead of a one-shot lookup at apply time. On 1.4.0 both
-  features stayed invisible (no error) because the session snapshot no longer
-  carries `chat` and the official renderer registers after this plugin
-  activates. See 「v1.4.1：为什么 1.4.0 在这版 DSH 上什么都没显示」.
-- **v1.4.2** — host compatibility with DSH Desktop 2.0.7 (dsh 0.1.5-rc.1):
-  `@deepseek-ai/dsh-session` stopped exporting the physical row codec
-  (`decodeStorageRecord`/`packChunkRuns`), the persistence `inspect()` seam was
-  replaced by the read-handle seam, and the live durable cursor moved from
-  `persistence.coordinator` onto the backend tracker's write handle. The codec
-  is now vendored in `lib/chunk-rows.js` and both host paths read the new APIs.
-  See 「v1.4.2：为什么 1.4.1 在 Desktop 2.0.7 上整个插件树加载失败」.
+- **v1.4.1** — client compatibility with DSH 0.1.2-rc.1: the Chat target is read
+  through the session-scope `chat` hook (`useChat`), and the `user`-node
+  takeover installs from an entry-mutation watch instead of a one-shot lookup at
+  apply time.
+- **v1.4.2** — host compatibility with DSH 0.1.5-rc.1: the physical-row codec is
+  vendored in `lib/chunk-rows.js`, stored sessions are read through the
+  persistence handle seam (`open(id, 'read')`), the live durable cursor is
+  rewound on `persistence.tracker.writers` (its `observedLength` guard
+  included), and the event log is read from `session.log`.
+- **v1.5.0** — a switch on the DSH settings **General** page turns the outline
+  rail (and its ☰ header button) on or off; the preference is a user setting in
+  the `conversation-rollback` namespace, persisted in `settings.yaml`.
+- **v1.5.1** — the settings row and the rail's copy follow the harness language
+  switch at runtime.
 
 [English](#english) · [中文](#中文)
 
@@ -59,6 +59,14 @@ right-edge **session outline rail** for the DeepSeek Harness (DSH) Web UI.
     never slide over it, and there is no z-index war.
   - Pinned state persists in `localStorage['dsh-session-toc:pinned']` (the
     same key the standalone plugin used, so existing pinned state survives).
+  - The whole rail can be switched off in **Settings → General → Session
+    outline**. Off means the rail and its ☰ button are both gone; the switch is
+    the only way back. The choice is a user setting — stored under
+    `conversation-rollback` in the harness home's `settings.yaml`, shared by the
+    web and desktop profiles — not a per-browser toggle. If the settings service
+    is unreachable the rail keeps its default (on) and the row says so, so a
+    missing settings service can never hide the feature by accident. Both the row
+    and the rail follow the harness language switch without a reload.
 - The latest completed turn only shows **Edit input**; rollback is not offered
   there.
 - Editing inputs that contain images is not supported yet.
@@ -74,68 +82,15 @@ right-edge **session outline rail** for the DeepSeek Harness (DSH) Web UI.
 
 - Rollback: `{ "sessionId": "...", "atSeq": <any seq inside a completed turn> }`
 - Edit: `{ "operation": "edit", "sessionId": "...", "turn": <turn number>, "text": "..." }`
+- Read the outline switch: `{ "operation": "settings.get" }` →
+  `{ "ok": true, "outline": true, "revision": 0 }`
+- Write it: `{ "operation": "settings.update", "patch": { "outline": false },
+  "expectedRevision": 0 }` → the same shape, or
+  `{ "ok": false, "code": "settings-conflict", ... }` when the namespace moved.
 
-The outline rail is purely client-side and needs no endpoint.
-
-### v1.4.1: why 1.4.0 rendered nothing on DSH 0.1.2-rc.1
-
-On DSH 0.1.2-rc.1 (DSH Desktop 2.0.5) the 1.4.0 client half activated — styles
-injected, rail header toggle registered — but **no** edit button, rollback
-button or rail appeared, and the console stayed silent. Two client-contract
-changes caused it:
-
-1. **Chat data moved off the session snapshot.** `useSession(snapshot =>
-   snapshot.chat)` always saw `undefined`, because the session snapshot
-   (`dsh-api-session-controller`'s `buildSnapshot()`) has no `chat` field; the
-   Chat target is now the session-scope `chat` hook (`useChat`, provided by
-   `dsh-client-ui-chat` via `ctx.uiSession.provide`). Every chat projection —
-   `finalAssistantFact`, `userTextForTurn`, `turnHasImage`, the rail's
-   `buildOutline` — therefore returned empty, and every component silently
-   returned `null`. v1.4.1 reads the target through `useChat` (with the legacy
-   field as fallback) and the rail subscribes to the per-session view target
-   (`uiConversation.binding(binding).target('chat')`).
-2. **The `user`-node takeover lost a registration race.**
-   `conversation.chat.user-actions` does not exist in this build; the takeover
-   is what declares it. 1.4.0 looked the official `user` renderer up once at
-   apply time, but this plugin only injects `slots`/`sessions`, so it activates
-   before ui-chat registers that renderer — the lookup missed and the edit
-   action was never registered. v1.4.1 watches
-   `slots.subscribe('conversation.chat.node', …)` and installs the takeover as
-   soon as an official renderer is visible, whatever the activation order.
-
-Both halves keep the older-build shape as a fallback, so one bundle spans
-0.1.2-rc.1 and the builds that carried `snapshot.chat`.
-
-### v1.4.2: why 1.4.1 failed to load at all on DSH 0.1.5-rc.1
-
-On DSH 0.1.5-rc.1 (DSH Desktop 2.0.7) the plugin tree failed to load with
-`The requested module '@deepseek-ai/dsh-session' does not provide an export
-named 'decodeStorageRecord'` — an ESM link error, so the whole plugin never
-activated. Three host-contract changes caused it:
-
-1. **The physical row codec left the public surface.** `decodeStorageRecord`
-   and `packChunkRuns` still ship inside `@deepseek-ai/dsh-session`
-   (`lib/types/chunk-rows.js`) but are no longer reachable through the root
-   entry, the `./types` subpath, or the package `exports` map. The rollback
-   host now carries a vendored copy (`lib/chunk-rows.js`); the row vocabulary
-   itself is unchanged — the v3 format decodes these rows through the frozen
-   v0 codec — so an in-place rewrite stays format-correct.
-   `interruptedTurnClosers` is still a public export and is imported from the
-   package as before.
-2. **`persistence.inspect(id)` is gone.** Stored sessions are now read through
-   the handle seam: `open(id, 'read')` + `handle.read()` (the full contiguous
-   log), with the stored header on the handle. The plugin closes the handle on
-   every path.
-3. **The live durable cursor moved.** `persistence.coordinator.states` no
-   longer exists; the cursor now lives on the backend tracker's live write
-   handle (`persistence.tracker.writers`). The live rollback surgery rewinds
-   that handle's cursor — and its `observedLength` guard, so a later read
-   cannot reject the shortened log as "shrunk". The Session event log also
-   moved from `session.events` to `session.log`; the host reads whichever the
-   running build exposes.
-
-The host route and both features are otherwise unchanged; the client bundle
-does not need a rebuild for this fix.
+An operation that is none of these still dispatches to rollback, so existing
+callers are unaffected. `settings.*` answers `settings-unavailable` on a build
+whose settings service is absent — the rail then keeps its default (on).
 
 ### Requirements
 
@@ -211,10 +166,10 @@ Option B — install a packed tarball:
 
 ```sh
 npm pack
-dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.2.tgz
+dsh plugin --profile <web|desktop> add ./conversation-rollback-1.5.1.tgz
 ```
 
-(The filename is whatever `npm pack` prints — `1.4.2` for the current
+(The filename is whatever `npm pack` prints — `1.5.1` for the current
 version.)
 
 #### 4. Migrating from 1.3.0 (or from the standalone session-toc plugin)
@@ -286,10 +241,12 @@ inputs and `lib/` the committed product.
 | `src/client.rollback.js` | rollback client bundle (upstream code + the single `FORK DEVIATION` marker below) |
 | `src/session-toc.js` | outline rail factory body (bundle shell stripped) |
 | `lib/client.js` | product of `pnpm run build` — **do not edit by hand** |
-| `lib/index.js` | host side (route, rewrite, live surgery) |
-| `lib/chunk-rows.js` | vendored port of dsh-session's internal physical-row codec (see v1.4.2 above) |
+| `lib/index.js` | host side (route, rewrite, live surgery, settings namespace) |
+| `lib/chunk-rows.js` | vendored port of dsh-session's internal physical-row codec |
 | `tools/merge-client.mjs` | splice / unsplice tool |
 | `test/chunk-rows.mjs` | host codec round-trip test (`pnpm test`) |
+| `test/host-route.mjs` | host-half route + settings-namespace test (`pnpm test`) |
+| `test/host-stubs.mjs` | in-memory import stubs the host test loads through a module hook |
 | `test/smoke.mjs` | browserless client smoke test (`pnpm test`) |
 
 ```sh
@@ -374,6 +331,12 @@ will not be rolled back automatically.
 - If the rail fails to mount, a red diagnostic bar (`dsh-toc-bar`) appears at
   the bottom-left of the page with the error message; the rollback half stays
   usable (the rail mounts in its own try/catch).
+- If the rail disappeared after switching it off and the settings row is not
+  reachable (older build, or the settings surface is broken), the preference is
+  still editable directly: set `conversation-rollback: { outline: true }` in the
+  harness home's `settings.yaml`, or POST
+  `{"operation":"settings.update","patch":{"outline":true}}` to
+  `/api/conversation-rollback` from the GUI's own origin.
 - If `dsh plugin add` fails for a git-hosted fork that adds a
   `prepare`/`postinstall` script, follow the `allowBuilds` hint printed by
   pnpm and add the exact key to the profile's `pnpm-workspace.yaml`, then
@@ -406,6 +369,12 @@ will not be rolled back automatically.
     rail 跟着移动而不被压住，也不需要抢 z-index。
   - 固定状态存在 `localStorage['dsh-session-toc:pinned']`（沿用旧独立插件
     的 key，合并前固定过的状态继续生效）。
+  - 整个 rail 可以在**设置 → 通用 → 会话大纲**里关掉。关掉后 rail 与 ☰ 按钮
+    一起消失，开关是唯一的回去路径；它是一项用户设置——存在 harness home 的
+    `settings.yaml` 的 `conversation-rollback` 段，web 与 desktop profile 共用
+    ——不是单浏览器开关。设置服务不可达时 rail 保持默认（开）并在行内说明，
+    绝不会因为读不到设置就把功能藏掉。开关行与 rail 本身都跟随 harness 的
+    语言切换，无需刷新。
 - 最新的已完成轮次只显示「修改输入」，不显示回退。
 - 包含图片的输入暂不支持修改。
 - 会话运行中、子代理会话、存在未结束回合时不可操作。
@@ -419,8 +388,14 @@ will not be rolled back automatically.
 
 - 回退：`{ "sessionId": "...", "atSeq": <完成轮次内任一 seq> }`
 - 修改：`{ "operation": "edit", "sessionId": "...", "turn": <turn number>, "text": "..." }`
+- 读大纲开关：`{ "operation": "settings.get" }` →
+  `{ "ok": true, "outline": true, "revision": 0 }`
+- 写大纲开关：`{ "operation": "settings.update", "patch": { "outline": false },
+  "expectedRevision": 0 }` → 同一形状；命名空间已被别处改动时返回
+  `{ "ok": false, "code": "settings-conflict", ... }`。
 
-会话目录是纯客户端功能，不需要端点。
+以上都不是的 operation 仍按回退分发，既有调用方不受影响。宿主没有设置服务时
+`settings.*` 返回 `settings-unavailable`，rail 保持默认（开）。
 
 ### 环境要求
 
@@ -429,55 +404,6 @@ will not be rolled back automatically.
 - `PATH` 中有 `pnpm`，供 `dsh plugin` 管理插件使用。
 - GitHub 安装和本地 clone 需要 `git`；只有使用 `npm pack` 方式时才需要
   `npm`。
-
-### v1.4.1：为什么 1.4.0 在这版 DSH 上什么都没显示
-
-DSH 0.1.2-rc.1（DSH Desktop 2.0.5）上，1.4.0 的客户端半身确实激活了（样式注
-入了、rail 的头部按钮注册了），但 ✎ 修改、↩ 回退、右侧 rail 一个都不出现，
-控制台也**没有任何报错**。原因是这版客户端契约有两处变化：
-
-1. **Chat 数据不再挂在 session 快照上**：`useSession(s => s.chat)` 恒为
-   `undefined`——session 快照（`dsh-api-session-controller` 的
-   `buildSnapshot()`）没有 `chat` 字段，Chat 目标改由会话级 hook `useChat`
-   暴露（`dsh-client-ui-chat` 的 `ctx.uiSession.provide`）。于是
-   `finalAssistantFact` / `userTextForTurn` / `turnHasImage` / rail 的
-   `buildOutline` 全部返回空，组件静默 `return null`。1.4.1 改用 `useChat`
-   （旧字段保留为回退），rail 改为订阅每会话的视图目标
-   （`uiConversation.binding(binding).target('chat')`）。
-2. **`user` 节点接管输掉了一次注册竞态**：这版没有
-   `conversation.chat.user-actions`，该 slot 正是由接管自己声明的。1.4.0 在
-   apply 时只查一次官方 `user` 渲染器，而本插件只 inject `slots`/`sessions`，
-   激活早于 ui-chat 注册该渲染器——查询落空，修改按钮从未注册。1.4.1 改为
-   监听 `slots.subscribe('conversation.chat.node', …)`，一旦看见官方渲染器就
-   安装接管，不再依赖激活顺序。
-
-两半都保留了旧版形态作为回退，因此同一个 bundle 同时兼容 0.1.2-rc.1 与仍带
-`snapshot.chat` 的版本。
-
-### v1.4.2：为什么 1.4.1 在 Desktop 2.0.7 上整个插件树加载失败
-
-DSH 0.1.5-rc.1（DSH Desktop 2.0.7）上插件树直接加载失败：
-`The requested module '@deepseek-ai/dsh-session' does not provide an export
-named 'decodeStorageRecord'`——这是 ESM 链接期错误，插件根本没有激活。原因
-是宿主契约有三处变化：
-
-1. **物理行编解码器离开了公开面**：`decodeStorageRecord` / `packChunkRuns`
-   仍随包发布（`lib/types/chunk-rows.js`），但根入口、`./types` 子路径和
-   `exports` 映射都不再暴露它们。宿主半身改为内置移植副本
-   （`lib/chunk-rows.js`）；行词汇本身没有变——v3 格式仍通过冻结的 v0
-   codec 解码这些行——所以原地重写日志依旧符合格式。
-   `interruptedTurnClosers` 仍是公开导出，照旧从包导入。
-2. **`persistence.inspect(id)` 已不存在**：已存储会话改走 handle 通道——
-   `open(id, 'read')` + `handle.read()`（完整连续日志），存储头挂在 handle
-   上；插件在所有路径上都会关闭 handle。
-3. **live durable cursor 搬家**：`persistence.coordinator.states` 已删除，
-   cursor 现在挂在后端 tracker 的 live write handle 上
-   （`persistence.tracker.writers`）。live 回退手术会同步回绕该 handle 的
-   cursor 及其 `observedLength` 守卫，避免后续读取把截短后的日志判为
-   "shrunk"。Session 事件日志也从 `session.events` 移到 `session.log`，
-   宿主半身按运行版本二选一读取。
-
-路由与两项功能其余不变；本次修复不需要重建客户端 bundle。
 
 ### 安装
 
@@ -541,10 +467,10 @@ dsh plugin --profile <web|desktop> add link:$PWD
 
 ```sh
 npm pack
-dsh plugin --profile <web|desktop> add ./conversation-rollback-1.4.2.tgz
+dsh plugin --profile <web|desktop> add ./conversation-rollback-1.5.1.tgz
 ```
 
-（文件名以 `npm pack` 输出为准——当前版本是 `1.4.2`。）
+（文件名以 `npm pack` 输出为准——当前版本是 `1.5.1`。）
 
 #### 4. 从 1.3.0 升级（或从独立 session-toc 插件迁移）
 
@@ -612,10 +538,12 @@ dsh plugin --profile <web|desktop> remove conversation-rollback
 | `src/client.rollback.js` | rollback 的 client bundle（上游原文 + 下方唯一一处 `FORK DEVIATION`） |
 | `src/session-toc.js` | rail 的 factory body（外壳已剥掉） |
 | `lib/client.js` | `pnpm run build` 的产物，**不要手改** |
-| `lib/index.js` | 宿主半（路由、重写、live 手术） |
-| `lib/chunk-rows.js` | 内置移植的 dsh-session 内部物理行编解码器（见上方 v1.4.2） |
+| `lib/index.js` | 宿主半（路由、重写、live 手术、设置命名空间） |
+| `lib/chunk-rows.js` | 内置移植的 dsh-session 内部物理行编解码器 |
 | `tools/merge-client.mjs` | 拼接 / 反拼接工具 |
 | `test/chunk-rows.mjs` | 宿主 codec 往返测试（`pnpm test`） |
+| `test/host-route.mjs` | 宿主半身路由 + 设置命名空间测试（`pnpm test`） |
+| `test/host-stubs.mjs` | 宿主测试通过 module hook 加载的内存 import 桩 |
 | `test/smoke.mjs` | 无浏览器冒烟测试（`pnpm test`） |
 
 ```sh
@@ -687,6 +615,11 @@ Desktop 宿主维护一个安装恢复账本，位置在
   并重启。
 - rail 挂载失败时页面左下角会出现红色诊断条（`dsh-toc-bar`）显示错误
   信息；rollback 半身仍可用（rail 在自己的 try/catch 中挂载）。
+- 关掉 rail 之后找不到设置里的那一行（旧版本，或设置界面本身坏了）时，偏好
+  仍可直接改：在 harness home 的 `settings.yaml` 里写
+  `conversation-rollback: { outline: true }`，或从 GUI 自己的源向后端
+  `/api/conversation-rollback` POST
+  `{"operation":"settings.update","patch":{"outline":true}}`。
 - 如果你的 fork 新增了 `prepare`/`postinstall` 脚本，`dsh plugin add` 安装
   git 依赖时被 pnpm 拦截，请按 pnpm 打印的提示把对应 key 加入 profile 的
   `pnpm-workspace.yaml` 的 `allowBuilds`，再重新执行安装。上游包没有构建
